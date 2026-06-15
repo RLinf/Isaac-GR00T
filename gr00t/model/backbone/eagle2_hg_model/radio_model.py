@@ -42,14 +42,78 @@ from transformers.utils import ModelOutput
 ####
 
 
-try:  # v1
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
-except ImportError:  # v2
-    from flash_attn.flash_attn_interface import (
-        flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
-    )
+_flash_attn_unpadded_qkvpacked_func = None
+_flash_pad_input = None
+_flash_unpad_input = None
+_npu_fusion_attention = None
+_npu_attn_mask_cache = {}
+_NPU_SPARSE_MODE = 3
 
-from flash_attn.bert_padding import pad_input, unpad_input
+
+def _get_flash_attention_backend():
+    global _flash_attn_unpadded_qkvpacked_func, _flash_pad_input, _flash_unpad_input
+
+    if _flash_attn_unpadded_qkvpacked_func is None:
+        try:  # v1
+            from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+        except ImportError:  # v2
+            from flash_attn.flash_attn_interface import (
+                flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
+            )
+        from flash_attn.bert_padding import pad_input, unpad_input
+
+        _flash_attn_unpadded_qkvpacked_func = flash_attn_unpadded_qkvpacked_func
+        _flash_pad_input = pad_input
+        _flash_unpad_input = unpad_input
+
+    return _flash_attn_unpadded_qkvpacked_func, _flash_pad_input, _flash_unpad_input
+
+
+def _get_npu_fusion_attention():
+    global _npu_fusion_attention
+
+    if _npu_fusion_attention is None:
+        try:
+            from torch_npu import npu_fusion_attention
+        except ImportError as exc:
+            raise ImportError(
+                "NPU flash attention requires torch_npu with npu_fusion_attention available."
+            ) from exc
+        _npu_fusion_attention = npu_fusion_attention
+
+    return _npu_fusion_attention
+
+
+def _get_npu_causal_mask(device, seqlen):
+    cached = _npu_attn_mask_cache.get(device)
+    if cached is None or cached.shape[0] < seqlen or cached.shape[1] < seqlen:
+        cached = torch.triu(torch.ones([seqlen, seqlen], device=device), diagonal=1).bool()
+        _npu_attn_mask_cache[device] = cached
+    return cached[:seqlen, :seqlen]
+
+
+def _npu_unpad_input(hidden_states, attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.reshape(-1), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1]).index_select(0, indices)
+    return hidden_states, indices, cu_seqlens, max_seqlen_in_batch
+
+
+def _npu_pad_input(hidden_states, indices, batch_size, seqlen):
+    output = torch.zeros(
+        batch_size * seqlen,
+        *hidden_states.shape[1:],
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    output.index_copy_(0, indices, hidden_states)
+    return output.reshape(batch_size, seqlen, *hidden_states.shape[1:])
+
+
+def _get_npu_softmax_scale(softmax_scale, head_dim):
+    return softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
 
 
 class FlashAttention(nn.Module):
@@ -87,6 +151,8 @@ class FlashAttention(nn.Module):
         assert not need_weights
         assert qkv.dtype in [torch.float16, torch.bfloat16]
         assert qkv.is_cuda
+        flash_attn_unpadded_qkvpacked_func, pad_input, unpad_input = _get_flash_attention_backend()
+
         if cu_seqlens is None:
             batch_size = qkv.shape[0]
             seqlen = qkv.shape[1]
@@ -139,6 +205,140 @@ class FlashAttention(nn.Module):
         return output, None
 
 
+class NPUFlashAttention(nn.Module):
+    def __init__(self, softmax_scale=None, attention_dropout=0.0, device=None, dtype=None):
+        super().__init__()
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
+
+    def _forward_varlen(
+        self,
+        qkv,
+        cu_seqlens,
+        max_s,
+        causal,
+        keep_prob,
+        npu_fusion_attention,
+    ):
+        query_states = qkv[:, 0, :, :]
+        key_states = qkv[:, 1, :, :]
+        value_states = qkv[:, 2, :, :]
+        head_num = query_states.shape[1]
+        scale = _get_npu_softmax_scale(self.softmax_scale, query_states.shape[-1])
+        actual_seq_len = tuple(cu_seqlens[1:].cpu().numpy().tolist())
+
+        kwargs = {
+            "pse": None,
+            "atten_mask": None,
+            "keep_prob": keep_prob,
+            "input_layout": "TND",
+            "scale": scale,
+            "actual_seq_qlen": actual_seq_len,
+            "actual_seq_kvlen": actual_seq_len,
+        }
+        if causal:
+            kwargs["padding_mask"] = None
+            kwargs["atten_mask"] = _get_npu_causal_mask(qkv.device, max_s)
+            kwargs["sparse_mode"] = _NPU_SPARSE_MODE
+
+        return npu_fusion_attention(
+            query_states,
+            key_states,
+            value_states,
+            head_num,
+            **kwargs,
+        )[0]
+
+    def forward(
+        self,
+        qkv,
+        key_padding_mask=None,
+        causal=False,
+        cu_seqlens=None,
+        max_s=None,
+        need_weights=False,
+    ):
+        assert not need_weights
+        assert qkv.dtype in [torch.float16]
+        npu_fusion_attention = _get_npu_fusion_attention()
+        keep_prob = 1.0 - self.dropout_p if self.training else 1.0
+
+        if cu_seqlens is None:
+            batch_size = qkv.shape[0]
+            seqlen = qkv.shape[1]
+
+            if key_padding_mask is None:
+                query_states = qkv[:, :, 0, :, :]
+                key_states = qkv[:, :, 1, :, :]
+                value_states = qkv[:, :, 2, :, :]
+                head_num = qkv.shape[3]
+                scale = _get_npu_softmax_scale(self.softmax_scale, qkv.shape[-1])
+
+                kwargs = {
+                    "keep_prob": keep_prob,
+                    "scale": scale,
+                }
+                if causal:
+                    kwargs["atten_mask"] = _get_npu_causal_mask(qkv.device, seqlen)
+                    kwargs["sparse_mode"] = _NPU_SPARSE_MODE
+
+                output = npu_fusion_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    head_num,
+                    "BSND",
+                    **kwargs,
+                )[0]
+            else:
+                nheads = qkv.shape[-2]
+                x = rearrange(qkv, "b s three h d -> b s (three h d)")
+                x_unpad, indices, cu_seqlens, max_s = _npu_unpad_input(x, key_padding_mask)
+                x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
+                output_unpad = self._forward_varlen(
+                    x_unpad,
+                    cu_seqlens,
+                    max_s,
+                    causal,
+                    keep_prob,
+                    npu_fusion_attention,
+                )
+                output = rearrange(
+                    _npu_pad_input(
+                        rearrange(output_unpad, "nnz h d -> nnz (h d)"),
+                        indices,
+                        batch_size,
+                        seqlen,
+                    ),
+                    "b s (h d) -> b s h d",
+                    h=nheads,
+                )
+        else:
+            assert max_s is not None
+            output = self._forward_varlen(
+                qkv,
+                cu_seqlens,
+                max_s,
+                causal,
+                keep_prob,
+                npu_fusion_attention,
+            )
+
+        return output, None
+
+
+class AutoFlashAttention(nn.Module):
+    def __init__(self, softmax_scale=None, attention_dropout=0.0, device=None, dtype=None):
+        super().__init__()
+        self.gpu_attn = FlashAttention(softmax_scale, attention_dropout, device, dtype)
+        self.npu_attn = NPUFlashAttention(softmax_scale, attention_dropout, device, dtype)
+
+    def forward(self, qkv, *args, **kwargs):
+        if qkv.device.type == "npu":
+            return self.npu_attn(qkv, *args, **kwargs)
+        return self.gpu_attn(qkv, *args, **kwargs)
+
+
 def _flash_attn(self, x: torch.Tensor) -> torch.Tensor:
     B, N, C = x.shape
 
@@ -160,23 +360,25 @@ def _flash_attn(self, x: torch.Tensor) -> torch.Tensor:
 
 
 def forward(self, x: torch.Tensor) -> torch.Tensor:
-    assert (
-        x.dtype == torch.bfloat16
-    ), "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
+    if x.device.type == "npu":
+        assert x.dtype == torch.float16, "NPU flash attention is only supported with float16 inputs."
+    else:
+        assert (
+            x.dtype == torch.bfloat16
+        ), "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
     result = self._flash_attn(x)
     return result
 
 
 def replace_vit_attn_with_flash_attn():
-    cuda_major, cuda_minor = torch.cuda.get_device_capability()
-    if cuda_major < 8:
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
         warnings.warn(
             "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
             "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523359593"
         )
 
     Attention.forward = forward
-    Attention.inner_attn = FlashAttention(attention_dropout=0.0)
+    Attention.inner_attn = AutoFlashAttention(attention_dropout=0.0)
     Attention._flash_attn = _flash_attn
 
 
