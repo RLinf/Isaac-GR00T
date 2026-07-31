@@ -19,19 +19,21 @@ from transformers.image_processing_utils_fast import (
     reorder_images,
 )
 
+# These two moved independently across 4.51 -> 4.57 -> 5.x, so they need
+# separate fallbacks: grouping them makes one missing name hide the other.
+try:
+    from transformers.image_processing_utils_fast import DefaultFastImageProcessorKwargs
+except ImportError:
+    # renamed in transformers>=5
+    from transformers.processing_utils import ImagesKwargs as DefaultFastImageProcessorKwargs
+
 try:
     from transformers.image_processing_utils_fast import (
         BASE_IMAGE_PROCESSOR_FAST_DOCSTRING,
         BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS,
-        DefaultFastImageProcessorKwargs,
     )
 except ImportError:
-    # transformers>=5 renamed the kwargs base and dropped the shared docstring
-    # fragments; they only feed add_start_docstrings, so empty strings suffice.
-    from transformers.image_processing_utils_fast import (
-        ImagesKwargs as DefaultFastImageProcessorKwargs,
-    )
-
+    # dropped in transformers>=4.57; they only feed add_start_docstrings
     BASE_IMAGE_PROCESSOR_FAST_DOCSTRING = ""
     BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS = ""
 from transformers.image_utils import (
