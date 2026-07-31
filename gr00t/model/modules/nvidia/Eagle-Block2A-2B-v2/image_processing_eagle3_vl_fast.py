@@ -13,14 +13,27 @@ from transformers.image_processing_utils import (
     select_best_resolution,
 )
 from transformers.image_processing_utils_fast import (
-    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING,
-    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS,
     BaseImageProcessorFast,
-    DefaultFastImageProcessorKwargs,
     divide_to_patches,
     group_images_by_shape,
     reorder_images,
 )
+
+try:
+    from transformers.image_processing_utils_fast import (
+        BASE_IMAGE_PROCESSOR_FAST_DOCSTRING,
+        BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS,
+        DefaultFastImageProcessorKwargs,
+    )
+except ImportError:
+    # transformers>=5 renamed the kwargs base and dropped the shared docstring
+    # fragments; they only feed add_start_docstrings, so empty strings suffice.
+    from transformers.image_processing_utils_fast import (
+        ImagesKwargs as DefaultFastImageProcessorKwargs,
+    )
+
+    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING = ""
+    BASE_IMAGE_PROCESSOR_FAST_DOCSTRING_PREPROCESS = ""
 from transformers.image_utils import (
     OPENAI_CLIP_MEAN,
     OPENAI_CLIP_STD,
@@ -28,14 +41,18 @@ from transformers.image_utils import (
     IMAGENET_STANDARD_STD,  # 0.5, 0.5, 0.5
     ChannelDimension,
     ImageInput,
-    VideoInput,
     PILImageResampling,
     SizeDict,
     get_image_size,
     make_flat_list_of_images,
-    make_batched_videos,
     validate_kwargs,
 )
+
+try:
+    # transformers>=5 moved the video helpers into their own module
+    from transformers.video_utils import VideoInput, make_batched_videos
+except ImportError:
+    from transformers.image_utils import VideoInput, make_batched_videos
 from transformers.processing_utils import Unpack
 from transformers.utils import (
     TensorType,
