@@ -1422,7 +1422,12 @@ class Siglip2PreTrainedModel(PreTrainedModel):
         "Siglip2EncoderLayer",
         "Siglip2MultiheadAttentionPoolingHead",
     ]
+    # transformers 5 renamed this flag to _supports_flash_attn and its support
+    # check reads only the new name, so declaring just the old one makes it
+    # refuse flash_attention_2 -- leaving text_config._attn_implementation unset
+    # and tripping the assert below. Declare both to work on 4 and 5.
     _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
 
     def _init_weights(self, module):

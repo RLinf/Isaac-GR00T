@@ -69,7 +69,12 @@ class Eagle3_VLPreTrainedModel(PreTrainedModel):
         "SiglipEncoderLayer",
     ]
     _skip_keys_device_placement = "past_key_values"
+    # transformers 5 renamed this flag to _supports_flash_attn and its support
+    # check reads only the new name, so declaring just the old one makes it
+    # refuse flash_attention_2 -- leaving text_config._attn_implementation unset
+    # and tripping the assert below. Declare both to work on 4 and 5.
     _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_cache_class = True
     _supports_static_cache = True
     _supports_quantized_cache = True
@@ -122,11 +127,23 @@ class Eagle3_VLForConditionalGeneration(Eagle3_VLPreTrainedModel, GenerationMixi
             elif config.text_config.architectures[0] == "Phi3ForCausalLM":
                 self.language_model = Phi3ForCausalLM(config.text_config)
             elif config.text_config.architectures[0] == "Qwen2ForCausalLM":
+                # Loading the config from JSON writes _attn_implementation on the
+                # top level only; the fan-out to sub-configs runs on assignment,
+                # which from_config no longer performs. Set it here, as the
+                # vision branches above already do, so the assert below sees the
+                # value the checkpoint asks for instead of None.
+                config.text_config._attn_implementation = "flash_attention_2"
                 assert (
                     config.text_config._attn_implementation == "flash_attention_2"
                 ), f"Qwen2 must use flash_attention_2 but got {config.text_config._attn_implementation}"
                 self.language_model = Qwen2ForCausalLM(config.text_config)
             elif config.text_config.architectures[0] == "Qwen3ForCausalLM":
+                # Loading the config from JSON writes _attn_implementation on the
+                # top level only; the fan-out to sub-configs runs on assignment,
+                # which from_config no longer performs. Set it here, as the
+                # vision branches above already do, so the assert below sees the
+                # value the checkpoint asks for instead of None.
+                config.text_config._attn_implementation = "flash_attention_2"
                 assert (
                     config.text_config._attn_implementation == "flash_attention_2"
                 ), f"Qwen3 must use flash_attention_2 but got {config.text_config._attn_implementation}"
